@@ -72,7 +72,7 @@ namespace glasslinq.bridge
                             LogMessage($"FROM CHROME: {message}");
 
                             // Forward web element data to Studio
-                            if (message.Contains("element_hovered"))
+                            if (message.Contains("element_hovered") || message.Contains("element_captured"))
                             {
                                 SendToStudio(message);
                             }
