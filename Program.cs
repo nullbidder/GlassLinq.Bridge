@@ -72,9 +72,16 @@ namespace glasslinq.bridge
                             LogMessage($"FROM CHROME: {message}");
 
                             // Forward web element data to Studio
-                            if (message.Contains("element_hovered") || message.Contains("element_captured"))
+                            if (message.Contains("element_hovered") ||
+                                message.Contains("element_captured") ||
+                                message.Contains("GET_TEXT_RESPONSE") ||
+                                message.Contains("CLICK_RESPONSE") ||
+                                message.Contains("TYPE_INTO_RESPONSE"))
                             {
-                                SendToStudio(message);
+                                // FIX: Offload SendToStudio to a background thread to prevent 1000ms pipe 
+                                // connection timeouts from bottlenecking the Chrome stdin reading loop.
+                                string messageToForward = message;
+                                Task.Run(() => SendToStudio(messageToForward));
                             }
                             else if (message.Contains("ping"))
                             {
@@ -154,17 +161,21 @@ namespace glasslinq.bridge
                             {
                                 LogMessage($"FROM STUDIO: {studioCommand}");
 
-                                // Directly forward the JSON string to Chrome
-                                // We check for the actions we added in C# (start_web_spy, stop_web_spy, web_spy_request)
+                                // Forward commands to Chrome
+                                // Design-time commands: start_web_spy, stop_web_spy, web_spy_request
+                                // Runtime commands: GET_TEXT, CLICK, TYPE_INTO, etc.
                                 if (studioCommand.Contains("web_spy_request") ||
                                     studioCommand.Contains("start_web_spy") ||
-                                    studioCommand.Contains("stop_web_spy"))
+                                    studioCommand.Contains("stop_web_spy") ||
+                                    studioCommand.Contains("GET_TEXT") ||
+                                    studioCommand.Contains("CLICK") ||
+                                    studioCommand.Contains("TYPE_INTO"))
                                 {
                                     ForwardToChrome(studioCommand);
                                 }
                                 else
                                 {
-                                    LogMessage("Studio command received but not recognized as a Web Spy action.");
+                                    LogMessage("Studio command received but not recognized.");
                                 }
                             }
                         }
