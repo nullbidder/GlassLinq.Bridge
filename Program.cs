@@ -14,6 +14,11 @@ namespace glasslinq.bridge
         private static readonly object _writeLock = new object();
         private static string logPath = @"C:\Temp\glasslinq_bridge_debug.txt";
 
+        // Runtime reply state — shared between the Chrome stdin loop and RunRuntimePipe
+        private static readonly object _pendingReplies = new object();
+        private static ManualResetEventSlim? _pendingReplyEvent = null;
+        private static string? _pendingReplyJson = null;
+
         static void Main(string[] args)
         {
             // Ensure log directory exists
@@ -24,7 +29,7 @@ namespace glasslinq.bridge
                 _stdout = Console.OpenStandardOutput();
                 LogMessage("Bridge Started");
 
-                // Start Studio listener in background
+                // Start Studio listeners in background
                 Task.Run(() => StartStudioListener());
 
                 // Main loop: Listen for messages FROM Chrome
@@ -71,17 +76,23 @@ namespace glasslinq.bridge
                             string message = Encoding.UTF8.GetString(buffer);
                             LogMessage($"FROM CHROME: {message}");
 
-                            // Forward web element data to Studio
+                            // Design-time spy responses — forward to SpyOverlayWindow
                             if (message.Contains("element_hovered") ||
-                                message.Contains("element_captured") ||
-                                message.Contains("GET_TEXT_RESPONSE") ||
-                                message.Contains("CLICK_RESPONSE") ||
-                                message.Contains("TYPE_INTO_RESPONSE"))
+                                message.Contains("element_captured"))
                             {
-                                // FIX: Offload SendToStudio to a background thread to prevent 1000ms pipe 
-                                // connection timeouts from bottlenecking the Chrome stdin reading loop.
                                 string messageToForward = message;
                                 Task.Run(() => SendToStudio(messageToForward));
+                            }
+                            // Runtime activity responses — signal the waiting RunRuntimePipe thread
+                            else if (message.Contains("CLICK_RESPONSE") ||
+                                     message.Contains("GET_TEXT_RESPONSE") ||
+                                     message.Contains("TYPE_INTO_RESPONSE"))
+                            {
+                                lock (_pendingReplies)
+                                {
+                                    _pendingReplyJson = message;
+                                    _pendingReplyEvent?.Set();
+                                }
                             }
                             else if (message.Contains("ping"))
                             {
@@ -108,7 +119,7 @@ namespace glasslinq.bridge
         }
 
         /// <summary>
-        /// Send message TO Chrome Extension
+        /// Send message TO Chrome Extension via stdout (native messaging protocol).
         /// </summary>
         private static void SendMessage(object message)
         {
@@ -136,68 +147,12 @@ namespace glasslinq.bridge
         }
 
         /// <summary>
-        /// Listen for commands FROM Studio via Named Pipe
-        /// </summary>
-        private static void StartStudioListener()
-        {
-            LogMessage("Studio listener started - Listening for Web Spy commands");
-
-            while (true)
-            {
-                try
-                {
-                    // Using a simpler NamedPipeServerStream setup for stability
-                    using (var server = new NamedPipeServerStream(
-                        "GlassLinqPipe",
-                        PipeDirection.In,
-                        NamedPipeServerStream.MaxAllowedServerInstances))
-                    {
-                        server.WaitForConnection();
-
-                        using (var reader = new StreamReader(server))
-                        {
-                            string? studioCommand = reader.ReadLine();
-                            if (!string.IsNullOrEmpty(studioCommand))
-                            {
-                                LogMessage($"FROM STUDIO: {studioCommand}");
-
-                                // Forward commands to Chrome
-                                // Design-time commands: start_web_spy, stop_web_spy, web_spy_request
-                                // Runtime commands: GET_TEXT, CLICK, TYPE_INTO, etc.
-                                if (studioCommand.Contains("web_spy_request") ||
-                                    studioCommand.Contains("start_web_spy") ||
-                                    studioCommand.Contains("stop_web_spy") ||
-                                    studioCommand.Contains("GET_TEXT") ||
-                                    studioCommand.Contains("CLICK") ||
-                                    studioCommand.Contains("TYPE_INTO"))
-                                {
-                                    ForwardToChrome(studioCommand);
-                                }
-                                else
-                                {
-                                    LogMessage("Studio command received but not recognized.");
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogMessage($"Studio listener error: {ex.Message}");
-                    // Brief sleep to prevent CPU hammering if the pipe fails repeatedly
-                    Thread.Sleep(50);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Forwards a raw JSON string from Studio directly to Chrome via Standard Output.
+        /// Forwards a raw JSON string from Studio directly to Chrome via stdout.
         /// </summary>
         private static void ForwardToChrome(string jsonMessage)
         {
             try
             {
-                // Chrome expects: [4-byte length prefix] + [JSON string]
                 byte[] bytes = Encoding.UTF8.GetBytes(jsonMessage);
                 byte[] len = BitConverter.GetBytes(bytes.Length);
 
@@ -219,27 +174,154 @@ namespace glasslinq.bridge
         }
 
         /// <summary>
-        /// Send web element data TO Studio via Named Pipe
+        /// Starts both Studio pipe listeners in parallel.
+        /// </summary>
+        private static void StartStudioListener()
+        {
+            LogMessage("Studio listeners starting");
+            Task.Run(() => RunSpyPipe());
+            Task.Run(() => RunRuntimePipe());
+        }
+
+        /// <summary>
+        /// One-way pipe for SpyOverlayWindow design-time commands (start_web_spy, stop_web_spy).
+        /// Fire-and-forget — no reply needed.
+        /// </summary>
+        private static void RunSpyPipe()
+        {
+            LogMessage("Spy pipe listening on GlassLinqPipe");
+
+            while (true)
+            {
+                try
+                {
+                    using var server = new NamedPipeServerStream(
+                        "GlassLinqPipe",
+                        PipeDirection.In,
+                        NamedPipeServerStream.MaxAllowedServerInstances);
+
+                    server.WaitForConnection();
+
+                    using var reader = new StreamReader(server);
+                    string? cmd = reader.ReadLine();
+                    if (!string.IsNullOrEmpty(cmd))
+                    {
+                        LogMessage($"FROM STUDIO (spy): {cmd}");
+
+                        if (cmd.Contains("web_spy_request") ||
+                            cmd.Contains("start_web_spy") ||
+                            cmd.Contains("stop_web_spy"))
+                        {
+                            ForwardToChrome(cmd);
+                        }
+                        else
+                        {
+                            LogMessage("Spy pipe: unrecognized command ignored.");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"Spy pipe error: {ex.Message}");
+                    Thread.Sleep(50);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Two-way pipe for runtime activity execution (CLICK, GET_TEXT, TYPE_INTO).
+        /// ClickActivity/GetTextActivity connect here, send a JSON command, and block
+        /// for the Chrome response on the same connection.
+        /// </summary>
+        private static void RunRuntimePipe()
+        {
+            LogMessage("Runtime pipe listening on GlassLinqBridge");
+
+            while (true)
+            {
+                try
+                {
+                    using var server = new NamedPipeServerStream(
+                        "GlassLinqBridge",
+                        PipeDirection.InOut,
+                        NamedPipeServerStream.MaxAllowedServerInstances,
+                        PipeTransmissionMode.Byte);
+
+                    server.WaitForConnection();
+                    LogMessage("Studio activity connected to GlassLinqBridge");
+
+                    using var reader = new StreamReader(server);
+                    using var writer = new StreamWriter(server) { AutoFlush = true };
+
+                    string? cmd = reader.ReadLine();
+                    if (string.IsNullOrEmpty(cmd))
+                    {
+                        LogMessage("Runtime pipe: empty command received, skipping.");
+                        continue;
+                    }
+
+                    LogMessage($"FROM STUDIO (runtime): {cmd}");
+
+                    // Register reply slot, forward command to Chrome, then wait
+                    var replyReady = new ManualResetEventSlim(false);
+
+                    lock (_pendingReplies)
+                    {
+                        _pendingReplyEvent = replyReady;
+                        _pendingReplyJson = null;
+                    }
+
+                    ForwardToChrome(cmd);
+
+                    // Block up to 8 seconds for Chrome to respond
+                    string? replyJson = null;
+                    if (replyReady.Wait(8000))
+                    {
+                        lock (_pendingReplies)
+                        {
+                            replyJson = _pendingReplyJson;
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(replyJson))
+                    {
+                        writer.WriteLine(replyJson);
+                        LogMessage($"TO STUDIO (runtime reply): {replyJson}");
+                        server.WaitForPipeDrain(); // ← add this
+                    }
+                    else
+                    {
+                        string timeout = "{\"success\":false,\"reason\":\"Bridge timeout — no response from Chrome within 8s\"}";
+                        writer.WriteLine(timeout);
+                        LogMessage("Runtime reply timed out — sent failure response to Studio.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"Runtime pipe error: {ex.Message}");
+                    Thread.Sleep(50);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Send web element data TO Studio via Named Pipe (spy capture responses).
         /// </summary>
         private static void SendToStudio(string json)
         {
             try
             {
-                using (var client = new NamedPipeClientStream(
+                using var client = new NamedPipeClientStream(
                     ".",
                     "GlassLinqResponse",
-                    PipeDirection.Out))
-                {
-                    // Wait up to 1 second for Studio to be ready
-                    client.Connect(1000);
+                    PipeDirection.Out);
 
-                    using (var writer = new StreamWriter(client) { AutoFlush = true })
-                    {
-                        writer.WriteLine(json);
-                    }
+                client.Connect(1000);
 
-                    LogMessage($"TO STUDIO: {json}");
-                }
+                using var writer = new StreamWriter(client) { AutoFlush = true };
+                writer.WriteLine(json);
+
+                LogMessage($"TO STUDIO: {json}");
             }
             catch (TimeoutException)
             {
@@ -252,7 +334,7 @@ namespace glasslinq.bridge
         }
 
         /// <summary>
-        /// Thread-safe logging
+        /// Thread-safe logging.
         /// </summary>
         private static void LogMessage(string message)
         {
@@ -263,7 +345,7 @@ namespace glasslinq.bridge
             }
             catch
             {
-                // Silently fail if logging fails - don't crash the bridge
+                // Silently fail — never crash the bridge over a log write
             }
         }
     }
