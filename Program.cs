@@ -184,8 +184,16 @@ namespace glasslinq.bridge
         }
 
         /// <summary>
-        /// One-way pipe for SpyOverlayWindow design-time commands (start_web_spy, stop_web_spy).
-        /// Fire-and-forget — no reply needed.
+        /// Bidirectional pipe for SpyOverlayWindow design-time commands AND any runtime
+        /// activity command (CLICK, TYPE_INTO, GET_TEXT) that mistakenly connects here
+        /// instead of GlassLinqBridge.
+        ///
+        /// Spy commands (start_web_spy, stop_web_spy, web_spy_request) are fire-and-forget:
+        /// forwarded to Chrome with no reply written back to the caller.
+        ///
+        /// Runtime commands are handled identically to RunRuntimePipe: forwarded to Chrome,
+        /// blocked up to 8 s for a Chrome response, then the reply is written back on the
+        /// same pipe connection so the activity does not time out.
         /// </summary>
         private static void RunSpyPipe()
         {
@@ -195,29 +203,79 @@ namespace glasslinq.bridge
             {
                 try
                 {
+                    // InOut so we can write the runtime reply back on the same connection.
+                    // SpyOverlayWindow opens this pipe as PipeDirection.Out, which is
+                    // compatible with a server that is InOut.
                     using var server = new NamedPipeServerStream(
                         "GlassLinqPipe",
-                        PipeDirection.In,
-                        NamedPipeServerStream.MaxAllowedServerInstances);
+                        PipeDirection.InOut,
+                        NamedPipeServerStream.MaxAllowedServerInstances,
+                        PipeTransmissionMode.Byte);
 
                     server.WaitForConnection();
 
                     using var reader = new StreamReader(server);
-                    string? cmd = reader.ReadLine();
-                    if (!string.IsNullOrEmpty(cmd))
-                    {
-                        LogMessage($"FROM STUDIO (spy): {cmd}");
+                    using var writer = new StreamWriter(server) { AutoFlush = true };
 
-                        if (cmd.Contains("web_spy_request") ||
-                            cmd.Contains("start_web_spy") ||
-                            cmd.Contains("stop_web_spy"))
+                    string? cmd = reader.ReadLine();
+                    if (string.IsNullOrEmpty(cmd)) continue;
+
+                    LogMessage($"FROM STUDIO (spy): {cmd}");
+
+                    // ── Design-time spy commands — fire-and-forget ───────────
+                    if (cmd.Contains("web_spy_request") ||
+                        cmd.Contains("start_web_spy") ||
+                        cmd.Contains("stop_web_spy"))
+                    {
+                        ForwardToChrome(cmd);
+                        // No reply needed; SpyOverlayWindow does not read back.
+                        continue;
+                    }
+
+                    // ── Runtime commands that arrived on the wrong pipe ───────
+                    // Activities (TypeIntoActivity, ClickActivity, GetTextActivity) should
+                    // connect to GlassLinqBridge, but if they connect here instead we handle
+                    // them correctly rather than silently dropping the message.
+                    if (cmd.Contains("\"CLICK\"") ||
+                        cmd.Contains("\"TYPE_INTO\"") ||
+                        cmd.Contains("\"GET_TEXT\""))
+                    {
+                        LogMessage("Spy pipe: runtime command detected — routing through Chrome bridge.");
+
+                        var replyReady = new ManualResetEventSlim(false);
+                        lock (_pendingReplies)
                         {
-                            ForwardToChrome(cmd);
+                            _pendingReplyEvent = replyReady;
+                            _pendingReplyJson = null;
+                        }
+
+                        ForwardToChrome(cmd);
+
+                        string? replyJson = null;
+                        if (replyReady.Wait(8000))
+                        {
+                            lock (_pendingReplies)
+                            {
+                                replyJson = _pendingReplyJson;
+                            }
+                        }
+
+                        if (!string.IsNullOrEmpty(replyJson))
+                        {
+                            writer.WriteLine(replyJson);
+                            server.WaitForPipeDrain();
+                            LogMessage($"Spy pipe: runtime reply sent: {replyJson}");
                         }
                         else
                         {
-                            LogMessage("Spy pipe: unrecognized command ignored.");
+                            string timeout = "{\"success\":false,\"reason\":\"Bridge timeout — no response from Chrome within 8s\"}";
+                            writer.WriteLine(timeout);
+                            LogMessage("Spy pipe: runtime reply timed out — sent failure response.");
                         }
+                    }
+                    else
+                    {
+                        LogMessage($"Spy pipe: unrecognized command ignored: {cmd.Substring(0, Math.Min(cmd.Length, 80))}");
                     }
                 }
                 catch (Exception ex)
