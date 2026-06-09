@@ -86,6 +86,9 @@ namespace glasslinq.bridge
                             // Runtime activity responses — signal the waiting RunRuntimePipe thread
                             else if (message.Contains("CLICK_RESPONSE") ||
                                      message.Contains("GET_TEXT_RESPONSE") ||
+                                     message.Contains("GET_ELEMENT_COUNT_RESPONSE") ||
+                                     message.Contains("GET_ELEMENT_ATTRIBUTE_RESPONSE") ||
+                                     message.Contains("GET_TABLE_DATA_RESPONSE") ||
                                      message.Contains("TYPE_INTO_RESPONSE"))
                             {
                                 lock (_pendingReplies)
